@@ -31,90 +31,144 @@ import com.amazonaws.services.s3.model.PartETag;
 import com.amazonaws.services.s3.model.PartListing;
 import com.amazonaws.services.s3.model.UploadPartRequest;
 
-public class S3Store implements Datastore {/// Set up the request
-    private static Request generateRequest(String reqBody) {
-        Request request = new DefaultRequest(SERVICE_NAME);
-        request.setContent(new ByteArrayInputStream(reqBody.getBytes()));
-        request.setEndpoint(URI.create(ENDPOINT));
-        request.setHttpMethod(HttpMethodName.POST);
-        return request;
- }
+public class S3Store implements Datastore {
+    protected static final Logger log = LoggerFactory.getLogger(S3Store.class.getName());
+    protected static String extensions = "creation,termination";
+    private AmazonS3 s3Client;
+    private String s3Bucket;
+    private Map<String, FileInfo> uploadIdByFileId = new HashMap<>();
+    private static final long MULTI_PART_SIZE = 5 * 1024 * 1024; // 5 MB
 
- /// Perform Signature Version 4 signing
- private static void performSigningSteps(Request requestToSign) {
-        AWS4Signer signer = new AWS4Signer();
-        signer.setServiceName(SERVICE_NAME);
-        signer.setRegionName(REGION);      
+    private static final String AWS_ACCESS_KEY_ID = "AWS_ACCESS_KEY_ID";
+    private static final String AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY";
+    private static final String AWS_S3_BUCKET = "AWS_S3_BUCKET";
+    private static final String AWS_DEFAULT_REGION = "AWS_DEFAULT_REGION";
 
-        // Get credentials
-        // NOTE: *Never* hard-code credentials
-        //       in source code
-        AWSCredentials creds = new BasicAWSCredentials(accessKey, secretKey);
+    @Override
+    public void init(Config config, Locker locker) throws Exception {
+        String awsAccessKeyId = System.getenv(AWS_ACCESS_KEY_ID) != null ? System.getenv(AWS_ACCESS_KEY_ID)
+                : config.getStringValue(AWS_ACCESS_KEY_ID);
+        String awsSecretAccessKey = System.getenv(AWS_SECRET_ACCESS_KEY) != null ? System.getenv(AWS_SECRET_ACCESS_KEY)
+                : config.getStringValue(AWS_SECRET_ACCESS_KEY);
 
-        // Sign request with supplied creds
-        signer.sign(requestToSign, creds);
- }
+        String awsRegion = System.getenv(AWS_DEFAULT_REGION) != null ? System.getenv(AWS_DEFAULT_REGION)
+                : config.getStringValue(AWS_DEFAULT_REGION);
+        String awsS3Bucket = System.getenv(AWS_S3_BUCKET) != null ? System.getenv(AWS_S3_BUCKET)
+                : config.getStringValue(AWS_S3_BUCKET);
 
- /// Send the request to the server
- private static void sendRequest(Request request) {
-        ExecutionContext context = new ExecutionContext(true);
+        if (awsAccessKeyId == null || awsSecretAccessKey == null || awsRegion == null || awsS3Bucket == null)
+            throw new Exception(String.format("Either %s or %s or %s or %s are missing", AWS_ACCESS_KEY_ID,
+                    AWS_SECRET_ACCESS_KEY, AWS_S3_BUCKET, AWS_DEFAULT_REGION));
 
-        ClientConfiguration clientConfiguration = new ClientConfiguration();
-        AmazonHttpClient client = new AmazonHttpClient(clientConfiguration);
+        AWSStaticCredentialsProvider creds = new AWSStaticCredentialsProvider(
+                new BasicAWSCredentials(awsAccessKeyId, awsSecretAccessKey));
 
-        MyHttpResponseHandler responseHandler = new MyHttpResponseHandler();
-        MyErrorHandler errorHandler = new MyErrorHandler();
+        this.s3Client = AmazonS3ClientBuilder.standard().withCredentials(creds).withRegion(awsRegion).build();
+        this.s3Bucket = awsS3Bucket;
 
-        Response response =
-                      client.execute(request, responseHandler, errorHandler, context);
- }
+    }
 
- public static void main(String[] args) {
-        // Generate the request
-        Request request = generateRequest("{\"field\":\"fieldValue\"}");
+    @Override
+    public String getExtensions() {
+        return extensions;
+    }
 
-        // Perform Signature Version 4 signing
-        performSigningSteps(request);
+    @Override
+    public void create(FileInfo fi) throws Exception {
+        InitiateMultipartUploadRequest initRequest = new InitiateMultipartUploadRequest(this.s3Bucket, fi.id);
+        InitiateMultipartUploadResult initResponse = s3Client.initiateMultipartUpload(initRequest);
+        fi.decodedMetadata.put("s3UploadId", initResponse.getUploadId());
+        saveFileInfo(fi);
+    }
 
-        // Send the request to the server
-        sendRequest(request);
- }
+    @Override
+    public long write(HttpServletRequest request, String id, long offset, long max) throws Exception {
+        FileInfo fi = getFileInfo(id);
+        if (fi == null)
+            throw new Exception("File not found");
 
- public static class MyHttpResponseHandler implements HttpResponseHandler> {
+        String uploadId = getS3uploadId(id);
+        if (uploadId == null)
+            throw new Exception("S3 Upload Id is not found");
 
-        @Override
-        public AmazonWebServiceResponse handle(
-                         com.amazonaws.http.HttpResponse response) throws Exception {
+        int currentPart = Integer.parseInt(fi.decodedMetadata.get("currentPart"));
+        // Upload the file parts.
+        long filePosition = fi.offset;
+        long contentLength = fi.entityLength;
+        long transferred = 0;
 
-                InputStream responseStream = response.getContent();
-                String responseString = convertStreamToString(responseStream);
-                System.out.println(responseString);
+        try (ReadableByteChannel rbc = Channels.newChannel(request.getInputStream());
+                InputStream is = Channels.newInputStream(rbc)) {
+            for (int i = currentPart + 1; filePosition < contentLength; i++) {
+                long partSize = Math.min(MULTI_PART_SIZE, (fi.entityLength - filePosition));
 
-                AmazonWebServiceResponse awsResponse = new AmazonWebServiceResponse();
-                return awsResponse;
+                log.info(String.format("Uploading part %s, at file position %s", i, filePosition));
+                UploadPartRequest uploadRequest = new UploadPartRequest().withBucketName(s3Bucket).withKey(fi.id)
+                        .withUploadId(uploadId).withPartNumber(i).withInputStream(is).withPartSize(partSize);
+                uploadRequest.getRequestClientOptions().setReadLimit((int) MULTI_PART_SIZE);
+                s3Client.uploadPart(uploadRequest);
+                filePosition += partSize;
+                transferred += partSize;
+            }
+        } catch (Exception e) {
+            log.error(String.format("File Upload Interrupted for key %s", fi.id));
         }
+        return transferred;
+    }
 
-        @Override
-        public boolean needsConnectionLeftOpen() {
-                return false;
-        }
- }
+    @Override
+    public FileInfo getFileInfo(String id) throws Exception {
+        FileInfo fi = uploadIdByFileId.get(id);
+        if (fi == null)
+            return fi;
+        String uploadId = getS3uploadId(id);
 
- public static class MyErrorHandler implements HttpResponseHandler {
+        // Calculate offset
+        ListPartsRequest listPartsRequest = new ListPartsRequest(s3Bucket, id, uploadId);
+        PartListing result = s3Client.listParts(listPartsRequest);
+        int currentPart = Math.max(result.getNextPartNumberMarker(), 0);
+        AtomicLong offset = new AtomicLong();
+        result.getParts().forEach(p -> offset.addAndGet(p.getSize()));
 
-        @Override
-        public AmazonServiceException handle(
-                         com.amazonaws.http.HttpResponse response) throws Exception {
-                System.out.println("In exception handler!");
+        fi.offset = offset.get();
+        fi.decodedMetadata.put("currentPart", String.valueOf(currentPart));
 
-                AmazonServiceException ase = new AmazonServiceException("Fake service exception.");
-                ase.setStatusCode(response.getStatusCode());
-                ase.setErrorCode(response.getStatusText());
-                return ase;
-          }
+        return uploadIdByFileId.get(id);
+    }
 
-        @Override
-        public boolean needsConnectionLeftOpen() {
-                return false;
-          }
- }}
+    @Override
+    public void saveFileInfo(FileInfo fileInfo) throws Exception {
+        uploadIdByFileId.put(fileInfo.id, fileInfo);
+    }
+
+    @Override
+    public void terminate(String id) throws Exception {
+        AbortMultipartUploadRequest abortReq = new AbortMultipartUploadRequest(s3Bucket, id, getS3uploadId(id));
+        s3Client.abortMultipartUpload(abortReq);
+
+    }
+
+    @Override
+    public void finish(String id) throws Exception {
+        ListPartsRequest request = new ListPartsRequest(s3Bucket, id, getS3uploadId(id));
+
+        PartListing result = s3Client.listParts(request);
+        List<PartETag> partETags = result.getParts().stream().map(p -> new PartETag(p.getPartNumber(), p.getETag()))
+                .collect(Collectors.toList());
+
+        CompleteMultipartUploadRequest compRequest = new CompleteMultipartUploadRequest(s3Bucket, id, getS3uploadId(id),
+                partETags);
+        s3Client.completeMultipartUpload(compRequest);
+    }
+
+    @Override
+    public void destroy() throws Exception {
+
+    }
+
+    private String getS3uploadId(String id) {
+        FileInfo fi = uploadIdByFileId.get(id);
+        return fi.decodedMetadata.get("s3UploadId");
+    }
+
+}
