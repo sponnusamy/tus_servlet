@@ -151,3 +151,11 @@ If using the servlet in a struts app, you'll need to configure struts.xml to ign
 * **maxFileSize** - Maxiumum number of bytes allowed for a single file.  0 means unlimited.
 * **maxStorage** - Maximum number of bytes this servlet will use for uploaded files.  0 means unlimited.  *NOT IMPLEMENTED.*
 * **maxRequest** - Maximum number of bytes server will accept in a single patch request.  0 means unlimited.
+* **datastoreProvider** - org.tus.servlet.upload.s3.S3Store
+
+## Environment Variables  - S3Store
+It is applicable only when datastoreProvider is S3
+* AWS_ACCESS_KEY_ID
+* AWS_SECRET_ACCESS_KEY
+* AWS_S3_BUCKET
+* AWS_DEFAULT_REGION
